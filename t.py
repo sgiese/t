@@ -3,6 +3,7 @@
 """t is for people that want do things, not organize their tasks."""
 
 from __future__ import with_statement, print_function
+from datetime import datetime
 
 import os, re, sys, hashlib
 from operator import itemgetter
@@ -31,6 +32,13 @@ class BadFile(Exception):
         super(BadFile, self).__init__()
         self.path = path
         self.problem = problem
+
+class MultipleInWork(Exception):
+    """ Raised when multiple tasks are in work """
+    def __init__(self, prefix1, prefix2):
+        super(MultipleInWork, self).__init__()
+        self.prefix1 = prefix1
+        self.prefix2 = prefix2
 
 
 def _hash(text):
@@ -63,24 +71,71 @@ def _task_from_taskline(taskline):
     elif '|' in taskline:
         text, _, meta = taskline.rpartition('|')
         task = { 'text': text.strip() }
-        for piece in meta.strip().split(','):
-            label, data = piece.split(':')
-            task[label.strip()] = data.strip()
+
+        def parse_meta(meta_string):
+            def parse_value(value):
+                value = value.strip()
+                if value.startswith('[') and value.endswith(']'):
+                    return [parse_value(item.strip()) for item in value[1:-1].split(',')]
+                elif value.startswith('{') and value.endswith('}'):
+                    return parse_meta(value[1:-1])
+                else:
+                    try:
+                        return float(value)  # Try to convert to float for timestamps
+                    except ValueError:
+                        return value.strip("'\"")  # Remove surrounding quotes if present
+
+            task = {}
+            parts = meta_string.split(',')
+            i = 0
+            while i < len(parts):
+                # Check if the current part contains a key-value pair
+                if ':' in parts[i]:
+                    # Split the part into key and value
+                    key, value = parts[i].split(':', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    
+                    # Check if the value is a list (starts with '[')
+                    if value.startswith('['):
+                        list_parts = [value]
+                        # Continue combining list elements until we find the closing bracket
+                        while not list_parts[-1].endswith(']'):
+                            i += 1
+                            if i < len(parts):
+                                list_parts.append(parts[i])
+                            else:
+                                break
+                        # Join the list elements back together
+                        value = ','.join(list_parts)
+                    
+                    # Parse the value and add it to the task dictionary
+                    task[key] = parse_value(value)
+                i += 1
+            return task
+
+        task.update(parse_meta(meta))
     else:
         text = taskline.strip()
         task = { 'id': _hash(text), 'text': text }
     return task
 
 def _tasklines_from_tasks(tasks):
-    """Parse a list of tasks into tasklines suitable for writing."""
+    def format_value(value):
+        if isinstance(value, list):
+            return '[' + ', '.join(format_value(v) for v in value) + ']'
+        elif isinstance(value, dict):
+            return '{' + ', '.join(f'{k}:{format_value(v)}' for k, v in value.items()) + '}'
+        elif isinstance(value, float):
+            return str(value)
+        else:
+            return f"'{value}'"
 
     tasklines = []
-
     for task in tasks:
         meta = [m for m in task.items() if m[0] != 'text']
-        meta_str = ', '.join('%s:%s' % m for m in meta)
-        tasklines.append('%s | %s\n' % (task['text'], meta_str))
-
+        meta_str = ', '.join(f'{k}:{format_value(v)}' for k, v in meta)
+        tasklines.append(f"{task['text']} | {meta_str}\n")
     return tasklines
 
 def _prefixes(ids):
@@ -133,6 +188,7 @@ class TaskDict(object):
         """Initialize by reading the task files, if they exist."""
         self.tasks = {}
         self.done = {}
+        self.current = None
         self.name = name
         self.taskdir = taskdir
         filemap = (('tasks', self.name), ('done', '.%s.done' % self.name))
@@ -150,6 +206,17 @@ class TaskDict(object):
                                 getattr(self, kind)[task['id']] = task
                 except IOError as e:
                     raise BadFile(path, e.strerror)
+        for task in self.tasks.values():
+            if 'timestamps' in task and len(task['timestamps']) % 2:
+                try:
+                    if self.current is not None:
+                        raise MultipleInWork(_prefixes(self.tasks)[self.current],
+                                         _prefixes(self.tasks)[task['id']])
+                    else:
+                        self.current = task['id']
+
+                except MultipleInWork as e:
+                    _die(f"Multiple tasks in progress. Current: {e.prefix1}, New: {e.prefix2}")
 
     def __getitem__(self, prefix):
         """Return the unfinished task with the given prefix.
@@ -182,6 +249,28 @@ class TaskDict(object):
                 prefixes = _prefixes(self.tasks)
                 print(prefixes[task_id])
 
+    def work_on_task(self, prefix):
+        task = self[prefix]
+        current_datetime = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        # create timestamps key if necessary
+        if 'timestamps' not in task:
+            task['timestamps'] = []
+
+        # stop working on the current task if it's not the same as the new task
+        if self.current is not None and self.current != task['id']:
+            print(f"stopping work on {_prefixes(self.tasks)[self.current]}")
+            self.tasks[self.current]['timestamps'].append(current_datetime)
+            
+        if not len(task['timestamps']) % 2:
+            print(f"starting work on task {prefix}")
+            self.current = task['id']
+        else:
+            self.current = None
+            print(f"stopping work on task {prefix}")
+
+        task['timestamps'].append(current_datetime)
+    
+
     def edit_task(self, prefix, text):
         """Edit the task with the given prefix.
 
@@ -209,7 +298,12 @@ class TaskDict(object):
 
         """
         task = self.tasks.pop(self[prefix]['id'])
+        if self.current == task['id']:
+            self.current = None
+            task['timestamps'].append(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        
         self.done[task['id']] = task
+
 
     def remove_task(self, prefix):
         """Remove the task from tasks list.
@@ -219,7 +313,9 @@ class TaskDict(object):
         be raised.
 
         """
-        self.tasks.pop(self[prefix]['id'])
+        task = self.tasks.pop(self[prefix]['id'])
+        if self.current == task['id']:
+            self.current = None
 
 
     def print_list(self, kind='tasks', verbose=False, quiet=False, grep=''):
@@ -234,8 +330,17 @@ class TaskDict(object):
         plen = max(map(lambda t: len(t[label]), tasks.values())) if tasks else 0
         for _, task in sorted(tasks.items()):
             if grep.lower() in task['text'].lower():
+                current_time = datetime.now()
+                in_work_status = ''
+                if self.current == task['id']:
+                    last_timestamp = datetime.strptime(task['timestamps'][-1], '%Y-%m-%d %H:%M:%S')
+                    time_diff = current_time - last_timestamp
+                    hours, remainder = divmod(time_diff.seconds, 3600)
+                    minutes, _ = divmod(remainder, 60)
+                    in_work_status = f' (in work {hours}h {minutes}m)'
+
                 p = '%s - ' % task[label].ljust(plen) if not quiet else ''
-                print(p + task['text'])
+                print(p + task['text'] + in_work_status)
 
     def write(self, delete_if_empty=False):
         """Flush the finished and unfinished tasks to the files on disk."""
@@ -252,9 +357,17 @@ class TaskDict(object):
                             tfile.write(taskline)
                 except IOError as e:
                     raise BadFile(path, e.strerror)
-
             elif not tasks and os.path.isfile(path):
                 os.remove(path)
+    
+        # Save current dictionary to .{self.name}.current file
+        current_path = os.path.join(os.path.expanduser(self.taskdir), f'.{self.name}.current')
+        try:
+            with open(current_path, 'w') as cfile:
+                for taskline in _tasklines_from_tasks(self.tasks.values()):
+                    cfile.write(taskline)
+        except IOError as e:
+            raise BadFile(current_path, e.strerror)
 
 
 def _die(message):
@@ -270,6 +383,8 @@ def _build_parser():
         "If no actions are specified the TEXT will be added as a new task.")
     actions.add_option("-e", "--edit", dest="edit", default="",
                        help="edit TASK to contain TEXT", metavar="TASK")
+    actions.add_option("-w", "--work", dest="work", default="",
+                       help="start/stop work on TASK", metavar="TASK")
     actions.add_option("-f", "--finish", dest="finish",
                        help="mark TASK as finished", metavar="TASK")
     actions.add_option("-r", "--remove", dest="remove",
@@ -322,6 +437,9 @@ def _main():
         elif options.edit:
             td.edit_task(options.edit, text)
             td.write(options.delete)
+        elif options.work:
+            td.work_on_task(options.work)
+            td.write(options.delete)
         elif text:
             td.add_task(text, verbose=options.verbose, quiet=options.quiet)
             td.write(options.delete)
@@ -340,4 +458,8 @@ def _main():
 
 
 if __name__ == '__main__':
-    _main()
+    try:
+        _main()
+    except MultipleInWork as e:
+        print(f"Error: Multiple tasks in progress. Current: {e.prefix1}, New: {e.prefix2}")
+        sys.exit(1)

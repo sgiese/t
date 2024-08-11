@@ -189,6 +189,13 @@ To split up your tasks into different lists you can add a few more aliases:
     alias m='python ~/path/to/t.py --task-dir ~/tasks --list music-to-buy'
     alias w='python ~/path/to/t.py --task-dir ~/tasks --list wines-to-try'
 
+### Time Tracking
+
+You can use `t` to track the time you spend on a task.  Just use `t -w ID` to start working on a task and `t -w ID` again to stop working on it.
+
+If t is already tracking time for another task, `t -w ID` will stop the tracking for the other task and start tracking time for the new one.
+
+
 ### Distributed Bugtracking
 
 Like the idea of distributed bug trackers like [BugsEverywhere][], but don't
